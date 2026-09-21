@@ -24,6 +24,10 @@ export function prsForBranch(branch) {
   );
 }
 
+export function markReady(number) {
+  gh(['pr', 'ready', String(number), '-R', TESTFLIGHT_REPO]);
+}
+
 export function prFiles(number) {
   return JSON.parse(gh(['pr', 'view', String(number), '-R', TESTFLIGHT_REPO, '--json', 'files'])).files.map(f => f.path);
 }

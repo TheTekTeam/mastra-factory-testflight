@@ -29,6 +29,16 @@ const { projectRepository } = must(
   }),
 );
 must('intake', await client.request('PUT', '/web/intake/config', { github: { enabled: true, sourceIds: [projectRepository.repositoryId] } }));
+// Observational Memory parity with Dell production's persisted memory_settings
+// (without it OM falls back to an upstream default model with no credentials).
+for (const [role, modelId, factoryId] of [
+  ['observer', 'openai/gpt-5.6-luna'],
+  ['reflector', 'openai/gpt-5.6-terra'],
+  ['observer', 'openai/gpt-5.6-luna', project.id],
+  ['reflector', 'openai/gpt-5.6-luna', project.id],
+]) {
+  must(`om ${role}`, await client.request('PUT', `/web/config/om/${role}/model`, { modelId, ...(factoryId ? { factoryId } : {}) }));
+}
 const status = must('github status', await client.get('/web/github/status'));
 console.log(
   JSON.stringify({

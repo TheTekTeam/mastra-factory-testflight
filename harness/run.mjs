@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Factory acceptance harness entrypoint. See harness/README.md for the boundary.
+import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 
 import { EvidenceRun } from './lib/evidence.mjs';
@@ -27,6 +28,14 @@ for (const required of ['factory-url', 'project', 'state-db', 'candidate-sha', '
 }
 
 const token = values.token ?? `RC-${values['candidate-sha'].slice(0, 8)}-${Date.now().toString(36)}`;
+// Evidence is bound to immutable harness source: refuse a dirty harness tree.
+const harnessDir = new URL('..', import.meta.url).pathname;
+const git = args => execFileSync('git', ['-C', harnessDir, ...args], { encoding: 'utf8' }).trim();
+const harnessSha = git(['rev-parse', 'HEAD']);
+if (git(['status', '--porcelain'])) {
+  console.error('harness working tree is dirty; commit the harness before an evidence run');
+  process.exit(2);
+}
 const client = new FactoryClient(values['factory-url']);
 await client.project(values.project); // refuses ModelSpend projects
 const run = new EvidenceRun({
@@ -38,6 +47,7 @@ const run = new EvidenceRun({
     projectId: values.project,
     baseBranch: values['base-branch'],
     token,
+    harnessSha,
   },
 });
 const ctx = createContext({ client, projectId: values.project, db: new StateDb(values['state-db']), token, baseBranch: values['base-branch'] });

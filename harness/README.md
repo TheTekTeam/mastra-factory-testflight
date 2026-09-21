@@ -35,6 +35,12 @@ Each scenario writes a PASS/FAIL verdict with its assertions and raw API
 evidence to `<out>/results.json`, and appends a human-readable line to
 `<out>/results.log`. The process exits non-zero if any selected scenario fails.
 
+## Fixture parity (fresh candidate state)
+
+`harness/fixtures/setup-project.mjs` provisions a fresh project through Factory's own API and applies **production-parity Observational Memory**. Fresh Factory state otherwise defaults OM to `google/gemini-3.5-flash`, while Dell production persists OpenAI-based OM (`memory_settings`: observer `openai/gpt-5.6-luna`, reflector `openai/gpt-5.6-terra` for `local/local`, and `openai/gpt-5.6-luna` for both roles at project scope). Without it, large-context runs such as `factory-review` abort in the OM processor for lack of a Google key.
+
+Native intake lists only non-draft PRs (upstream `includeDrafts: false`), so review-board scenarios mark the PR ready first, as a person would.
+
 ## Repository-local skills
 
 `.agents/skills/` holds deterministic Factory skills used by the lifecycle

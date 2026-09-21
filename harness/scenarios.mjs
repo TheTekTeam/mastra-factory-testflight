@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
 import { waitFor } from './lib/factory.mjs';
-import { createIssue, prFiles, prsForBranch, TESTFLIGHT_REPO } from './lib/github.mjs';
+import { createIssue, markReady, prFiles, prsForBranch, TESTFLIGHT_REPO } from './lib/github.mjs';
 
 const KEY = rid => `external-orchestrator:${rid}`;
 const DONE = new Set(['succeeded', 'failed', 'dismissed', 'superseded']);
@@ -450,6 +450,10 @@ export const SCENARIOS = [
     async run(ctx, { check, note }) {
       const pr = ctx.pr;
       if (!pr) throw new Error('requires implement_pr to have produced a PR');
+      // Native intake lists only non-draft PRs (upstream includeDrafts: false); a PR is
+      // handed to review the way a person would: mark it ready.
+      markReady(pr.number);
+      check('PR marked ready for review (non-draft)', prsForBranch(pr.headRefName)[0]?.isDraft === false);
       const intake = await waitFor('PR in native intake', async () => {
         const res = await ctx.client.get('/web/intake/items');
         return res.body?.items?.find(i => i.metadata?.number === pr.number && i.externalSource?.type !== 'issue') ?? null;
@@ -487,25 +491,55 @@ export const SCENARIOS = [
         });
       };
 
+      // Upstream semantics: only a review→review re-entry that SUPERSEDES A LIVE pass
+      // continues the session (resume + cancelInFlight). A card the review agent has
+      // already moved to done re-enters via the full factory-rereview skill instead.
+      // So re-enter while the first pass is demonstrably in flight ("PR updated mid-review").
       const toReview = await transition('review');
       check('intake → review accepted', toReview.status >= 200 && toReview.status < 300, toReview.status);
-      const first = await decide('first-review', d => d.decision?.type === 'invokeSkill' && d.decision?.role === 'review');
-      check('first factory-review pass succeeded', first.status === 'succeeded', first.status);
-      check('first pass is a full skill kickoff (resume not set)', first.decision?.resume !== true, first.decision);
-      const binding = ctx.db.bindings(item.id).find(b => b.role === 'review' && b.status === 'active');
-      check('review seat bound', Boolean(binding));
+      const firstRow = await waitFor('first-review decision', async () =>
+        ctx.db.decisionsForItem(item.id).find(d => d.decision?.type === 'invokeSkill' && d.decision?.role === 'review') ?? null,
+      { timeoutMs: 120_000, intervalMs: 500 });
+      check('first pass is a full factory-review kickoff (resume not set)', firstRow.decision?.skillName === 'factory-review' && firstRow.decision?.resume !== true, firstRow.decision);
+      const proposed = await waitFor('first-review proposed', async () => {
+        const r = ctx.db.decisionsForItem(item.id).find(d => d.id === firstRow.id);
+        return r && r.status !== 'pending' ? r : null;
+      }, { timeoutMs: 120_000, intervalMs: 500 });
+      if (proposed.status === 'proposed') {
+        const res = await ctx.client.post(`/web/factory/projects/${ctx.projectId}/decisions/${firstRow.id}/approve`, {});
+        if (res.status !== 200) throw new Error(`approve first-review failed ${res.status}`);
+      }
+      const live = await waitFor('first review pass in flight', async () => {
+        const r = ctx.db.decisionsForItem(item.id).find(d => d.id === firstRow.id);
+        const seat = ctx.db.bindings(item.id).find(b => b.role === 'review' && b.status === 'active');
+        if (!r || r.status !== 'leased' || !seat) return null;
+        const msgs = ctx.db.messages(seat.thread_id);
+        const kick = msgs.find(m => isKickoff(m) && m.text.includes('<skill name="factory-review">'));
+        const working = kick && msgs.some(m => m.role === 'assistant' && m.createdAt > kick.createdAt);
+        const current = await ctx.client.workItem(ctx.projectId, item.id);
+        return working && current?.stages?.includes('review') ? { seat, kick } : null;
+      }, { timeoutMs: 600_000, intervalMs: 500 });
+      check('first review pass proven in flight (leased, kicked off, agent working, card in review)', true);
+      const binding = live.seat;
       const since = new Date().toISOString();
 
       const reenter = await transition('review', { reenter: true });
-      check('review → review re-entry accepted', reenter.status >= 200 && reenter.status < 300, reenter.status);
+      check('review → review re-entry accepted while the first pass is live', reenter.status >= 200 && reenter.status < 300, reenter.status);
       const second = await decide('reentry-review', d => d.decision?.type === 'invokeSkill' && d.decision?.resume === true);
-      check('re-entry decision carries native resume + cancelInFlight', second.decision?.resume === true && second.decision?.cancelInFlight === true, second.decision);
+      check('re-entry decision carries native resume + cancelInFlight', second.decision?.resume === true && second.decision?.cancelInFlight === true && second.decision?.skillName === 'factory-review', second.decision);
       check('re-entry run succeeded', second.status === 'succeeded', second.status);
-      const after = ctx.db.bindings(item.id).filter(b => b.role === 'review' && b.status === 'active');
-      check('same review session continued (no new seat)', after.length === 1 && after[0].id === binding?.id, after.map(b => b.id));
-      const kickoff = ctx.db.messages(binding.thread_id).filter(m => m.createdAt >= since).find(isKickoff);
+      const firstFinal = ctx.db.decisionsForItem(item.id).find(d => d.id === firstRow.id);
+      note('firstPassFinal', { status: firstFinal?.status, attempts: firstFinal?.attempts });
+      check('superseded first pass settled (not left running or retrying)', DONE.has(firstFinal?.status), firstFinal?.status);
+      const seats = ctx.db.bindings(item.id).filter(b => b.role === 'review');
+      check('same review session continued (single review seat, no new one minted)', seats.length === 1 && seats[0].id === binding.id, seats.map(b => [b.id, b.status]));
+      const tail = ctx.db.messages(binding.thread_id).filter(m => m.createdAt >= since);
+      const kickoff = tail.find(isKickoff);
       note('reentryKickoff', kickoff?.text.slice(0, 600));
       check('compact continuation (skill referenced, body not re-pasted)', Boolean(kickoff) && kickoff.text.includes('Resume the active factory-review session') && kickoff.text.length < 4000, kickoff?.text.length);
+      const continued = tail.filter(m => m.role === 'assistant' && kickoff && m.createdAt > kickoff.createdAt && m.text.trim().length > 0);
+      note('continuationExecution', { assistantMessagesAfterKickoff: continued.length, last: continued.at(-1)?.text.slice(0, 300) });
+      check('continued session actually executed after the compact kickoff', continued.length > 0, continued.length);
       ctx.reviewItem = item;
     },
   },
