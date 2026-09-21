@@ -445,102 +445,137 @@ export const SCENARIOS = [
   },
   {
     id: 'native_same_stage_continuation',
-    title: 'review→review re-entry continues the live factory-review session with a compact kickoff',
-    gates: ['same-stage re-entry', 'same-stage continuation', 'completion review'],
+    title: 'review→review re-entry: serialized against a live pass, and compact continuation that executes',
+    gates: ['same-stage re-entry', 'same-stage continuation', 'completion review', 're-review'],
     async run(ctx, { check, note }) {
-      const pr = ctx.pr;
-      if (!pr) throw new Error('requires implement_pr to have produced a PR');
-      // Native intake lists only non-draft PRs (upstream includeDrafts: false); a PR is
-      // handed to review the way a person would: mark it ready.
-      markReady(pr.number);
-      check('PR marked ready for review (non-draft)', prsForBranch(pr.headRefName)[0]?.isDraft === false);
-      const intake = await waitFor('PR in native intake', async () => {
-        const res = await ctx.client.get('/web/intake/items');
-        return res.body?.items?.find(i => i.metadata?.number === pr.number && i.externalSource?.type !== 'issue') ?? null;
-      }, { timeoutMs: 180_000, intervalMs: 5_000 });
-      note('prIntake', intake.externalSource);
-      const created = await ctx.client.post(`/web/factory/projects/${ctx.projectId}/work-items`, {
-        title: intake.title,
-        board: 'review',
-        externalSource: intake.externalSource,
-      });
-      check('review-board work item created for the PR', [200, 201].includes(created.status) && created.body?.workItem?.board === 'review', created.body?.workItem?.board);
-      let item = created.body.workItem;
-
-      const decide = async (label, predicate) => {
-        const row = await waitFor(`${label} decision`, async () => ctx.db.decisionsForItem(item.id).find(predicate) ?? null, { timeoutMs: 120_000, intervalMs: 1_000 });
-        const proposed = await waitFor(`${label} proposed`, async () => {
-          const r = ctx.db.decisionsForItem(item.id).find(d => d.id === row.id);
-          return r && r.status !== 'pending' ? r : null;
-        }, { timeoutMs: 120_000, intervalMs: 500 });
-        if (proposed.status === 'proposed') {
-          const res = await ctx.client.post(`/web/factory/projects/${ctx.projectId}/decisions/${row.id}/approve`, {});
-          if (res.status !== 200) throw new Error(`approve ${label} failed ${res.status}`);
-        }
-        const settled = await waitFor(`${label} settled`, async () => {
-          const r = ctx.db.decisionsForItem(item.id).find(d => d.id === row.id);
-          return r && DONE.has(r.status) ? r : null;
-        }, { timeoutMs: 900_000, intervalMs: 3_000 });
-        note(label, { id: settled.id, status: settled.status, attempts: settled.attempts, decision: settled.decision });
-        return settled;
+      // Upstream 0.15.0 + 8c29150 + 4c7005a semantics:
+      //  - a review→review re-entry emits factory-review with resume + cancelInFlight;
+      //  - per-binding serialization makes it WAIT for the live pass to end (no preemption,
+      //    no concurrent kickoff); if that pass completes the card (done), the queued resume
+      //    is superseded and does not run;
+      //  - when the card is still in review with a live seat and no run in flight, the resume
+      //    is delivered as a compact continuation and the session executes it.
+      // Approval arms an item (later decisions auto-run), so part B uses a second, unarmed PR.
+      const reviewItemFor = async (pr, label) => {
+        markReady(pr.number);
+        check(`[${label}] PR marked ready (native intake lists non-drafts only)`, prsForBranch(pr.headRefName)[0]?.isDraft === false);
+        const intake = await waitFor(`[${label}] PR in native intake`, async () => {
+          const res = await ctx.client.get('/web/intake/items');
+          return res.body?.items?.find(i => i.metadata?.number === pr.number && i.externalSource?.type === 'pull-request') ?? null;
+        }, { timeoutMs: 180_000, intervalMs: 5_000 });
+        const created = await ctx.client.post(`/web/factory/projects/${ctx.projectId}/work-items`, {
+          title: intake.title, board: 'review', externalSource: intake.externalSource,
+        });
+        check(`[${label}] review-board work item created`, [200, 201].includes(created.status) && created.body?.workItem?.board === 'review', created.body?.workItem?.board);
+        return created.body.workItem;
       };
-      const transition = async (stage, extra = {}) => {
-        item = await ctx.client.workItem(ctx.projectId, item.id);
+      const transition = async (item, stage, extra = {}) => {
+        const current = await ctx.client.workItem(ctx.projectId, item.id);
         return ctx.client.post(`/web/factory/projects/${ctx.projectId}/work-items/${item.id}/transition`, {
-          board: 'review', stage, expectedRevision: item.revision, requestId: randomUUID(), cause: `harness: ${stage}`, ...extra,
+          board: 'review', stage, expectedRevision: current.revision, requestId: randomUUID(), cause: `harness: ${stage}`, ...extra,
         });
       };
+      const decisionFor = (item, pred, label, timeoutMs = 120_000) =>
+        waitFor(`[${label}] decision`, async () => ctx.db.decisionsForItem(item.id).find(pred) ?? null, { timeoutMs, intervalMs: 500 });
+      const settled = (item, id, label, timeoutMs = 900_000) =>
+        waitFor(`[${label}] settled`, async () => {
+          const r = ctx.db.decisionsForItem(item.id).find(d => d.id === id);
+          return r && DONE.has(r.status) ? r : null;
+        }, { timeoutMs, intervalMs: 2_000 });
+      const releaseIfProposed = async (item, id, verb, label) => {
+        const r = await waitFor(`[${label}] leaves pending`, async () => {
+          const x = ctx.db.decisionsForItem(item.id).find(d => d.id === id);
+          return x && x.status !== 'pending' ? x : null;
+        }, { timeoutMs: 120_000, intervalMs: 500 });
+        if (r.status !== 'proposed') return r.status;
+        const res = await ctx.client.post(`/web/factory/projects/${ctx.projectId}/decisions/${id}/${verb}`, {});
+        if (res.status !== 200) throw new Error(`[${label}] ${verb} failed ${res.status} ${JSON.stringify(res.body)}`);
+        return verb;
+      };
+      const reviewKickoffs = (seat, since) => ctx.db.messages(seat.thread_id).filter(m => m.createdAt >= since && isKickoff(m) && m.text.includes('<skill name="factory-review">'));
 
-      // Upstream semantics: only a review→review re-entry that SUPERSEDES A LIVE pass
-      // continues the session (resume + cancelInFlight). A card the review agent has
-      // already moved to done re-enters via the full factory-rereview skill instead.
-      // So re-enter while the first pass is demonstrably in flight ("PR updated mid-review").
-      const toReview = await transition('review');
-      check('intake → review accepted', toReview.status >= 200 && toReview.status < 300, toReview.status);
-      const firstRow = await waitFor('first-review decision', async () =>
-        ctx.db.decisionsForItem(item.id).find(d => d.decision?.type === 'invokeSkill' && d.decision?.role === 'review') ?? null,
-      { timeoutMs: 120_000, intervalMs: 500 });
-      check('first pass is a full factory-review kickoff (resume not set)', firstRow.decision?.skillName === 'factory-review' && firstRow.decision?.resume !== true, firstRow.decision);
-      const proposed = await waitFor('first-review proposed', async () => {
-        const r = ctx.db.decisionsForItem(item.id).find(d => d.id === firstRow.id);
-        return r && r.status !== 'pending' ? r : null;
-      }, { timeoutMs: 120_000, intervalMs: 500 });
-      if (proposed.status === 'proposed') {
-        const res = await ctx.client.post(`/web/factory/projects/${ctx.projectId}/decisions/${firstRow.id}/approve`, {});
-        if (res.status !== 200) throw new Error(`approve first-review failed ${res.status}`);
-      }
-      const live = await waitFor('first review pass in flight', async () => {
-        const r = ctx.db.decisionsForItem(item.id).find(d => d.id === firstRow.id);
-        const seat = ctx.db.bindings(item.id).find(b => b.role === 'review' && b.status === 'active');
+      // ── Part A: re-entry while a factory-review pass is live ─────────────
+      const itemA = await reviewItemFor(ctx.pr, 'A');
+      check('[A] intake → review accepted', (await transition(itemA, 'review')).status === 200);
+      const firstA = await decisionFor(itemA, d => d.decision?.type === 'invokeSkill' && d.decision?.role === 'review', 'A first');
+      check('[A] first pass is a full factory-review (resume not set)', firstA.decision?.skillName === 'factory-review' && firstA.decision?.resume !== true, firstA.decision);
+      await releaseIfProposed(itemA, firstA.id, 'approve', 'A first');
+      const liveA = await waitFor('[A] first pass in flight', async () => {
+        const r = ctx.db.decisionsForItem(itemA.id).find(d => d.id === firstA.id);
+        const seat = ctx.db.bindings(itemA.id).find(b => b.role === 'review' && b.status === 'active');
         if (!r || r.status !== 'leased' || !seat) return null;
         const msgs = ctx.db.messages(seat.thread_id);
         const kick = msgs.find(m => isKickoff(m) && m.text.includes('<skill name="factory-review">'));
         const working = kick && msgs.some(m => m.role === 'assistant' && m.createdAt > kick.createdAt);
-        const current = await ctx.client.workItem(ctx.projectId, item.id);
-        return working && current?.stages?.includes('review') ? { seat, kick } : null;
+        const current = await ctx.client.workItem(ctx.projectId, itemA.id);
+        return working && current?.stages?.includes('review') ? { seat } : null;
       }, { timeoutMs: 600_000, intervalMs: 500 });
-      check('first review pass proven in flight (leased, kicked off, agent working, card in review)', true);
-      const binding = live.seat;
-      const since = new Date().toISOString();
+      check('[A] first pass proven in flight at re-entry', true);
+      const sinceA = new Date().toISOString();
+      check('[A] review → review re-entry accepted mid-pass', (await transition(itemA, 'review', { reenter: true })).status === 200);
+      const resumeA = await decisionFor(itemA, d => d.decision?.resume === true, 'A resume');
+      check('[A] re-entry emits native factory-review resume + cancelInFlight', resumeA.decision?.skillName === 'factory-review' && resumeA.decision?.cancelInFlight === true, resumeA.decision);
+      const firstFinalA = await settled(itemA, firstA.id, 'A first');
+      const resumeFinalA = await settled(itemA, resumeA.id, 'A resume');
+      const itemAfterA = await ctx.client.workItem(ctx.projectId, itemA.id);
+      const kickoffsA = reviewKickoffs(liveA.seat, sinceA);
+      note('partA', { firstStatus: firstFinalA.status, resumeStatus: resumeFinalA.status, stages: itemAfterA.stages, kickoffsAfterReentry: kickoffsA.length });
+      check('[A] live pass ran to completion once (serialized, not preempted)', firstFinalA.status === 'succeeded');
+      check('[A] no second factory-review kickoff delivered into the live binding', kickoffsA.length === 0, kickoffsA.length);
+      check('[A] pass completed the card (review → done by the agent)', itemAfterA.stages.includes('done'), itemAfterA.stages);
+      check('[A] queued resume superseded without executing (status alone is not execution proof)',
+        DONE.has(resumeFinalA.status) && kickoffsA.length === 0 && ctx.db.bindings(itemA.id).every(b => b.status !== 'active'),
+        { resumeStatus: resumeFinalA.status });
 
-      const reenter = await transition('review', { reenter: true });
-      check('review → review re-entry accepted while the first pass is live', reenter.status >= 200 && reenter.status < 300, reenter.status);
-      const second = await decide('reentry-review', d => d.decision?.type === 'invokeSkill' && d.decision?.resume === true);
-      check('re-entry decision carries native resume + cancelInFlight', second.decision?.resume === true && second.decision?.cancelInFlight === true && second.decision?.skillName === 'factory-review', second.decision);
-      check('re-entry run succeeded', second.status === 'succeeded', second.status);
-      const firstFinal = ctx.db.decisionsForItem(item.id).find(d => d.id === firstRow.id);
-      note('firstPassFinal', { status: firstFinal?.status, attempts: firstFinal?.attempts });
-      check('superseded first pass settled (not left running or retrying)', DONE.has(firstFinal?.status), firstFinal?.status);
-      const seats = ctx.db.bindings(item.id).filter(b => b.role === 'review');
-      check('same review session continued (single review seat, no new one minted)', seats.length === 1 && seats[0].id === binding.id, seats.map(b => [b.id, b.status]));
-      const tail = ctx.db.messages(binding.thread_id).filter(m => m.createdAt >= since);
-      const kickoff = tail.find(isKickoff);
-      note('reentryKickoff', kickoff?.text.slice(0, 600));
-      check('compact continuation (skill referenced, body not re-pasted)', Boolean(kickoff) && kickoff.text.includes('Resume the active factory-review session') && kickoff.text.length < 4000, kickoff?.text.length);
-      const continued = tail.filter(m => m.role === 'assistant' && kickoff && m.createdAt > kickoff.createdAt && m.text.trim().length > 0);
-      note('continuationExecution', { assistantMessagesAfterKickoff: continued.length, last: continued.at(-1)?.text.slice(0, 300) });
-      check('continued session actually executed after the compact kickoff', continued.length > 0, continued.length);
-      ctx.reviewItem = item;
+      // ── Part B: compact continuation delivered to the live seat and executed ─
+      const issueB = createIssue(
+        `TESTFLIGHT.${ctx.token}-B — native continuation fixture`,
+        `Second PR for the #134 native same-stage continuation scenario (token \`${ctx.token}-B\`).`,
+      );
+      const intakeB = await waitFor('[B] issue in native intake', async () => {
+        const res = await ctx.client.get('/web/intake/items');
+        return res.body?.items?.find(i => i.metadata?.number === issueB.number) ?? null;
+      }, { timeoutMs: 180_000, intervalMs: 5_000 });
+      const workB = (await ctx.client.post(`/web/factory/projects/${ctx.projectId}/work-items`, { title: intakeB.title, externalSource: intakeB.externalSource })).body.workItem;
+      const saved = { item: ctx.item, issue: ctx.issue };
+      ctx.item = workB;
+      ctx.issue = issueB;
+      const impl = await ctx.invoke({ role: 'work', skillName: 'testflight-implement', args: `issue=${issueB.number} token=${ctx.token}-B base=${ctx.baseBranch}`, note, label: 'B implement' });
+      const prB = await waitFor('[B] PR', async () => prsForBranch(ctx.binding('work').branch)[0] ?? null, { timeoutMs: 120_000 });
+      ctx.item = saved.item;
+      ctx.issue = saved.issue;
+      check('[B] second PR produced', impl.settled.status === 'succeeded' && Boolean(prB), prB?.number);
+      const itemB = await reviewItemFor(prB, 'B');
+      check('[B] intake → review accepted', (await transition(itemB, 'review')).status === 200);
+      const firstB = await decisionFor(itemB, d => d.decision?.type === 'invokeSkill' && d.decision?.role === 'review', 'B first');
+      check('[B] onEnter proposal dismissed (item stays unarmed, nothing runs)', (await releaseIfProposed(itemB, firstB.id, 'dismiss', 'B first')) === 'dismiss');
+      const seatRun = await ctx.client.automationRun(ctx.projectId, itemB.id, {
+        requestId: randomUUID(), expectedRevision: (await ctx.client.workItem(ctx.projectId, itemB.id)).revision,
+        role: 'review', skillName: 'testflight-review', arguments: `issue=${issueB.number} token=${ctx.token}-B expected_head=${prB.headRefOid}`,
+      });
+      check('[B] review seat opened via native /automation-runs', seatRun.status === 202, seatRun.status);
+      const seatDecision = await decisionFor(itemB, d => d.decision?.skillName === 'testflight-review', 'B seat');
+      await releaseIfProposed(itemB, seatDecision.id, 'approve', 'B seat');
+      const seatDone = await settled(itemB, seatDecision.id, 'B seat');
+      const seatB = ctx.db.bindings(itemB.id).find(b => b.role === 'review' && b.status === 'active');
+      check('[B] seat run completed; card still in review with a live seat', seatDone.status === 'succeeded' && Boolean(seatB) && (await ctx.client.workItem(ctx.projectId, itemB.id)).stages.includes('review'));
+      const sinceB = new Date().toISOString();
+      check('[B] review → review re-entry accepted', (await transition(itemB, 'review', { reenter: true })).status === 200);
+      const resumeB = await decisionFor(itemB, d => d.decision?.resume === true, 'B resume');
+      check('[B] native factory-review resume + cancelInFlight', resumeB.decision?.skillName === 'factory-review' && resumeB.decision?.cancelInFlight === true, resumeB.decision);
+      await releaseIfProposed(itemB, resumeB.id, 'approve', 'B resume');
+      const resumeFinalB = await settled(itemB, resumeB.id, 'B resume');
+      check('[B] resume decision succeeded', resumeFinalB.status === 'succeeded', resumeFinalB.status);
+      const seatsB = ctx.db.bindings(itemB.id).filter(b => b.role === 'review');
+      check('[B] same review session continued (single review seat)', seatsB.length === 1 && seatsB[0].id === seatB.id, seatsB.map(b => [b.id, b.status]));
+      const tailB = ctx.db.messages(seatB.thread_id).filter(m => m.createdAt >= sinceB);
+      const kickoffB = tailB.find(m => isKickoff(m) && m.text.includes('<skill name="factory-review">'));
+      note('reentryKickoff', kickoffB?.text.slice(0, 600));
+      check('[B] compact continuation delivered (skill referenced, body not re-pasted)', Boolean(kickoffB) && kickoffB.text.includes('Resume the active factory-review session') && kickoffB.text.length < 4000, kickoffB?.text.length);
+      const executed = tailB.filter(m => m.role === 'assistant' && kickoffB && m.createdAt > kickoffB.createdAt && m.text.trim().length > 0);
+      note('continuationExecution', { assistantMessagesAfterKickoff: executed.length, last: executed.at(-1)?.text.slice(0, 300) });
+      check('[B] continued session actually executed after the compact kickoff', executed.length > 0, executed.length);
+      ctx.reviewItem = itemB;
     },
   },
   {
@@ -564,7 +599,8 @@ export const SCENARIOS = [
       });
       note('bindings', bindings);
       check('every binding revoked', bindings.every(b => b.status === 'revoked' && b.revoked_at));
-      const after = await ctx.submit({ role: 'work', skillName: 'testflight-probe', args: 'probe=after-terminal' });
+      const afterToken = `${ctx.token}-after-terminal`;
+      const after = await ctx.submit({ role: 'work', skillName: 'testflight-probe', args: `probe=${afterToken}` });
       note('afterTerminal', after.res);
       if (after.res.status === 202) {
         await ctx.approve(after.requestId).catch(() => null);
@@ -572,7 +608,8 @@ export const SCENARIOS = [
         // Upstream (5e4ddac) short-circuits a no-seat role on a terminal card and records
         // the decision as settled without running it. Execution is what matters: prove
         // no kickoff, no answer and no seat. Decision status is evidence only.
-        const ran = ctx.db.all("select count(*) as n from mastra_messages where content like ?", '%probe=after-terminal%')[0].n;
+        // Run-unique token: repository source (read by review agents) can't contain it.
+        const ran = ctx.db.all('select count(*) as n from mastra_messages where content like ?', `%${afterToken}%`)[0].n;
         note('postTerminalDecision', { status: settled.status, attempts: settled.attempts, executedMessages: ran });
         check('post-terminal request never executes (no kickoff/answer)', ran === 0, { executedMessages: ran, decisionStatus: settled.status });
       } else {
