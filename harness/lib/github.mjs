@@ -20,7 +20,7 @@ export function closeIssue(number, comment) {
 /** Pull requests whose head branch matches. */
 export function prsForBranch(branch) {
   return JSON.parse(
-    gh(['pr', 'list', '-R', TESTFLIGHT_REPO, '--state', 'all', '--head', branch, '--json', 'number,headRefOid,headRefName,state,isDraft,url']),
+    gh(['pr', 'list', '-R', TESTFLIGHT_REPO, '--state', 'all', '--head', branch, '--json', 'number,headRefOid,headRefName,baseRefName,state,isDraft,url']),
   );
 }
 

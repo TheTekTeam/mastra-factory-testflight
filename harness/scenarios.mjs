@@ -51,10 +51,21 @@ export function createContext({ client, projectId, db, token, baseBranch }) {
     return { requestId, body, res };
   };
 
+  // Consent is only meaningful once the dispatcher has proposed the decision;
+  // approving a still-`pending` row is rejected, so wait for `proposed` first.
   ctx.approve = async requestId => {
-    const [row] = db.decisionsByKey(KEY(requestId));
-    if (!row) throw new Error(`no decision for ${requestId}`);
-    return client.post(`/web/factory/projects/${projectId}/decisions/${row.id}/approve`, {});
+    const row = await waitFor(
+      `decision ${requestId} to be proposed`,
+      async () => {
+        const [r] = db.decisionsByKey(KEY(requestId));
+        return r && r.status !== 'pending' ? r : null;
+      },
+      { timeoutMs: 120_000, intervalMs: 500 },
+    );
+    if (row.status !== 'proposed') return { status: 'not-required', body: { decisionStatus: row.status } };
+    const res = await client.post(`/web/factory/projects/${projectId}/decisions/${row.id}/approve`, {});
+    if (res.status !== 200) throw new Error(`approve ${row.id} failed: ${res.status} ${JSON.stringify(res.body)}`);
+    return res;
   };
 
   ctx.settle = async (requestId, timeoutMs = 600_000) =>
@@ -97,6 +108,8 @@ export function createContext({ client, projectId, db, token, baseBranch }) {
   return ctx;
 }
 
+// Dispatcher kickoffs are persisted as signal messages (role 'signal', type 'user').
+const isKickoff = m => (m.role === 'user' || m.type === 'user') && m.text.includes('<skill name=');
 const lastAssistant = messages => messages.filter(m => m.role === 'assistant' && !m.text.includes('"type":"error"')).at(-1)?.text ?? '';
 const field = (text, name) => text.match(new RegExp(`${name}=([^\\s\`]+)`))?.[1] ?? null;
 
@@ -305,17 +318,19 @@ export const SCENARIOS = [
     },
   },
   {
-    id: 'same_stage_continuation',
-    title: 'same-stage re-entry continues the live session without re-sending the skill',
-    gates: ['same-stage re-entry', 'same-stage continuation'],
+    id: 'ingress_reinvocation_same_binding',
+    title: 'repeated external invocation reuses the live binding/session with fresh arguments',
+    gates: ['same-stage re-entry (orchestrator ingress)'],
     async run(ctx, { check, note }) {
       const bindingBefore = ctx.binding('work');
       const { settled, messages } = await ctx.invoke({ role: 'work', skillName: 'testflight-probe', args: `probe=${ctx.token}-reentry`, note, label: 'reentry' });
-      check('re-entry succeeded', settled.status === 'succeeded', settled);
-      check('same binding/session reused', ctx.binding('work').id === bindingBefore.id);
-      const kickoff = messages.find(m => m.role === 'user' && m.text.includes('testflight-probe'));
-      check('compact continuation, not the full skill body', Boolean(kickoff) && kickoff.text.includes('Resume the active testflight-probe session') && !kickoff.text.includes('This is a qualification fixture'), kickoff?.text.slice(0, 400));
+      check('re-invocation succeeded', settled.status === 'succeeded', settled);
+      check('same binding/session reused (no new seat)', ctx.binding('work').id === bindingBefore.id && ctx.db.bindings(ctx.item.id).filter(b => b.role === 'work').length === 1);
       check('fresh arguments delivered', field(lastAssistant(messages), 'TESTFLIGHT_PROBE') === `${ctx.token}-reentry`);
+      // By upstream contract /automation-runs decisions never carry `resume`, so an
+      // external re-invocation re-delivers the full skill. Recorded, not asserted.
+      const kickoff = messages.filter(isKickoff).find(m => m.text.includes('<skill name="testflight-probe">'));
+      note('kickoffForm', kickoff?.text.includes('Resume the active') ? 'compact-resume' : 'full-skill (by /automation-runs contract)');
     },
   },
   {
@@ -339,12 +354,14 @@ export const SCENARIOS = [
       const messages = ctx.threadMessages('work', since);
       const spans = committed.map(s => {
         const t = s.body.arguments.split('=')[1];
-        const start = messages.find(m => m.role === 'user' && m.text.includes(t))?.createdAt;
+        const starts = messages.filter(m => isKickoff(m) && m.text.includes(`probe=${t}`));
+        const start = starts[0]?.createdAt;
+        const kickoffCount = starts.length;
         const end = messages.filter(m => m.role === 'assistant' && m.text.includes(`TESTFLIGHT_PROBE=${t}`)).at(-1)?.createdAt;
-        return { token: t, start, end };
+        return { token: t, start, end, kickoffCount };
       });
       note('spans', spans);
-      check('each run delivered and answered exactly once', spans.every(s => s.start && s.end), spans);
+      check('each run delivered and answered exactly once', spans.every(s => s.start && s.end && s.kickoffCount === 1), spans);
       const ordered = [...spans].sort((a, b) => a.start.localeCompare(b.start));
       const overlaps = ordered.slice(1).filter((s, i) => s.start < ordered[i].end);
       check('no run started before the previous finished', overlaps.length === 0, overlaps);
@@ -377,7 +394,7 @@ export const SCENARIOS = [
     title: 'implementation opens a PR containing only the proof file',
     gates: ['implementation', 'validation'],
     async run(ctx, { check, note }) {
-      const { settled, messages } = await ctx.invoke({ role: 'work', skillName: 'testflight-implement', args: `issue=${ctx.issue.number} token=${ctx.token}-v1`, note, label: 'implement-v1' });
+      const { settled, messages } = await ctx.invoke({ role: 'work', skillName: 'testflight-implement', args: `issue=${ctx.issue.number} token=${ctx.token}-v1 base=${ctx.baseBranch}`, note, label: 'implement-v1' });
       check('implementation run succeeded', settled.status === 'succeeded', settled);
       const reply = lastAssistant(messages);
       check('skill reported PASS', field(reply, 'TESTFLIGHT_IMPLEMENT') === 'PASS', reply.slice(0, 400));
@@ -387,6 +404,7 @@ export const SCENARIOS = [
       note('pr', pr);
       check('PR head equals reported head', pr.headRefOid === field(reply, 'TESTFLIGHT_HEAD'), { pr: pr.headRefOid, reported: field(reply, 'TESTFLIGHT_HEAD') });
       const files = prFiles(pr.number);
+      check('PR targets the configured project base branch', pr.baseRefName === ctx.baseBranch, pr.baseRefName);
       check('PR changes only the proof file', files.length === 1 && files[0] === `proofs/issue-${ctx.issue.number}.md`, files);
     },
   },
@@ -410,7 +428,7 @@ export const SCENARIOS = [
     gates: ['re-review', 'exact-head validation/review'],
     async run(ctx, { check, note }) {
       const before = ctx.pr;
-      const impl = await ctx.invoke({ role: 'work', skillName: 'testflight-implement', args: `issue=${ctx.issue.number} token=${ctx.token}-v2`, note, label: 'implement-v2' });
+      const impl = await ctx.invoke({ role: 'work', skillName: 'testflight-implement', args: `issue=${ctx.issue.number} token=${ctx.token}-v2 base=${ctx.baseBranch}`, note, label: 'implement-v2' });
       check('follow-up implementation succeeded', impl.settled.status === 'succeeded', impl.settled);
       const after = prsForBranch(ctx.binding('work').branch)[0];
       note('pr', { before, after });
@@ -423,6 +441,72 @@ export const SCENARIOS = [
       check('re-review verdict APPROVE', field(reply, 'TESTFLIGHT_REVIEW') === 'APPROVE');
       const stale = await ctx.invoke({ role: 'review', skillName: 'testflight-review', args: `issue=${ctx.issue.number} token=${ctx.token}-v2 expected_head=${before.headRefOid}`, note, label: 'review-stale-head' });
       check('review against a stale expected head is rejected', field(lastAssistant(stale.messages), 'TESTFLIGHT_REVIEW') === 'REQUEST_CHANGES');
+    },
+  },
+  {
+    id: 'native_same_stage_continuation',
+    title: 'review→review re-entry continues the live factory-review session with a compact kickoff',
+    gates: ['same-stage re-entry', 'same-stage continuation', 'completion review'],
+    async run(ctx, { check, note }) {
+      const pr = ctx.pr;
+      if (!pr) throw new Error('requires implement_pr to have produced a PR');
+      const intake = await waitFor('PR in native intake', async () => {
+        const res = await ctx.client.get('/web/intake/items');
+        return res.body?.items?.find(i => i.metadata?.number === pr.number && i.externalSource?.type !== 'issue') ?? null;
+      }, { timeoutMs: 180_000, intervalMs: 5_000 });
+      note('prIntake', intake.externalSource);
+      const created = await ctx.client.post(`/web/factory/projects/${ctx.projectId}/work-items`, {
+        title: intake.title,
+        board: 'review',
+        externalSource: intake.externalSource,
+      });
+      check('review-board work item created for the PR', [200, 201].includes(created.status) && created.body?.workItem?.board === 'review', created.body?.workItem?.board);
+      let item = created.body.workItem;
+
+      const decide = async (label, predicate) => {
+        const row = await waitFor(`${label} decision`, async () => ctx.db.decisionsForItem(item.id).find(predicate) ?? null, { timeoutMs: 120_000, intervalMs: 1_000 });
+        const proposed = await waitFor(`${label} proposed`, async () => {
+          const r = ctx.db.decisionsForItem(item.id).find(d => d.id === row.id);
+          return r && r.status !== 'pending' ? r : null;
+        }, { timeoutMs: 120_000, intervalMs: 500 });
+        if (proposed.status === 'proposed') {
+          const res = await ctx.client.post(`/web/factory/projects/${ctx.projectId}/decisions/${row.id}/approve`, {});
+          if (res.status !== 200) throw new Error(`approve ${label} failed ${res.status}`);
+        }
+        const settled = await waitFor(`${label} settled`, async () => {
+          const r = ctx.db.decisionsForItem(item.id).find(d => d.id === row.id);
+          return r && DONE.has(r.status) ? r : null;
+        }, { timeoutMs: 900_000, intervalMs: 3_000 });
+        note(label, { id: settled.id, status: settled.status, attempts: settled.attempts, decision: settled.decision });
+        return settled;
+      };
+      const transition = async (stage, extra = {}) => {
+        item = await ctx.client.workItem(ctx.projectId, item.id);
+        return ctx.client.post(`/web/factory/projects/${ctx.projectId}/work-items/${item.id}/transition`, {
+          board: 'review', stage, expectedRevision: item.revision, requestId: randomUUID(), cause: `harness: ${stage}`, ...extra,
+        });
+      };
+
+      const toReview = await transition('review');
+      check('intake → review accepted', toReview.status >= 200 && toReview.status < 300, toReview.status);
+      const first = await decide('first-review', d => d.decision?.type === 'invokeSkill' && d.decision?.role === 'review');
+      check('first factory-review pass succeeded', first.status === 'succeeded', first.status);
+      check('first pass is a full skill kickoff (resume not set)', first.decision?.resume !== true, first.decision);
+      const binding = ctx.db.bindings(item.id).find(b => b.role === 'review' && b.status === 'active');
+      check('review seat bound', Boolean(binding));
+      const since = new Date().toISOString();
+
+      const reenter = await transition('review', { reenter: true });
+      check('review → review re-entry accepted', reenter.status >= 200 && reenter.status < 300, reenter.status);
+      const second = await decide('reentry-review', d => d.decision?.type === 'invokeSkill' && d.decision?.resume === true);
+      check('re-entry decision carries native resume + cancelInFlight', second.decision?.resume === true && second.decision?.cancelInFlight === true, second.decision);
+      check('re-entry run succeeded', second.status === 'succeeded', second.status);
+      const after = ctx.db.bindings(item.id).filter(b => b.role === 'review' && b.status === 'active');
+      check('same review session continued (no new seat)', after.length === 1 && after[0].id === binding?.id, after.map(b => b.id));
+      const kickoff = ctx.db.messages(binding.thread_id).filter(m => m.createdAt >= since).find(isKickoff);
+      note('reentryKickoff', kickoff?.text.slice(0, 600));
+      check('compact continuation (skill referenced, body not re-pasted)', Boolean(kickoff) && kickoff.text.includes('Resume the active factory-review session') && kickoff.text.length < 4000, kickoff?.text.length);
+      ctx.reviewItem = item;
     },
   },
   {
@@ -451,7 +535,12 @@ export const SCENARIOS = [
       if (after.res.status === 202) {
         await ctx.approve(after.requestId).catch(() => null);
         const settled = await ctx.settle(after.requestId, 180_000);
-        check('post-terminal request does not execute', settled.status !== 'succeeded', settled.status);
+        // Upstream (5e4ddac) short-circuits a no-seat role on a terminal card and records
+        // the decision as settled without running it. Execution is what matters: prove
+        // no kickoff, no answer and no seat. Decision status is evidence only.
+        const ran = ctx.db.all("select count(*) as n from mastra_messages where content like ?", '%probe=after-terminal%')[0].n;
+        note('postTerminalDecision', { status: settled.status, attempts: settled.attempts, executedMessages: ran });
+        check('post-terminal request never executes (no kickoff/answer)', ran === 0, { executedMessages: ran, decisionStatus: settled.status });
       } else {
         check('post-terminal request rejected', after.res.status >= 400, after.res.status);
       }
